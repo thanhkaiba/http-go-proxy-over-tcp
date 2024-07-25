@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/elazarl/goproxy"
+	"github.com/thanhkaiba/httproxytcp"
 	"log"
 	"net/http"
 	"os"
@@ -20,15 +20,15 @@ func main() {
 				"Don't waste your time!")
 		})
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
-	p := NewHTTP()
-	p.Start(HTTPArgs{
+	p := httproxytcp.NewHTTPProxyOverTCP()
+	p.Start(httproxytcp.HTTPArgs{
 		Local:       ":8284",
 		HTTPTimeout: 30,
 		Timeout:     2000,
 	}, proxy, log.New(os.Stdout, "\r\n", log.LstdFlags))
 	Clean(p)
 }
-func Clean(s *HTTPOverTCP) {
+func Clean(s *httproxytcp.HTTPOverTCP) {
 	signalChan := make(chan os.Signal, 1)
 	cleanupDone := make(chan bool)
 	signal.Notify(signalChan,

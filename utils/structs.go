@@ -3,7 +3,7 @@ package utils
 import (
 	"bytes"
 	"fmt"
-	"github.com/snail007/goproxy/utils/sni"
+	"github.com/thanhkaiba/httproxytcp/utils/sni"
 	"io"
 	logger "log"
 	"net"
