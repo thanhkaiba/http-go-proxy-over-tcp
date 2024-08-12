@@ -1,15 +1,12 @@
 package httproxytcp
 
 import (
-	"bufio"
-	"bytes"
 	"fmt"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/thanhkaiba/httproxytcp/utils"
 	"io"
 	logger "log"
 	"net"
-	"net/http"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -17,25 +14,25 @@ import (
 )
 
 type HTTPOverTCP struct {
-	cfg             HTTPArgs
-	proxy           HttpProxy // a http proxy to handle http traffic
-	lockChn         chan bool
-	isStop          bool
-	log             *logger.Logger
-	serverChannels  []*utils.ServerChannel
-	userConnections cmap.ConcurrentMap[string, *net.Conn]
+	outPool        utils.OutConn
+	cfg            HTTPArgs
+	lockChn        chan bool
+	isStop         bool
+	serverChannels []*utils.ServerChannel
+	userConns      cmap.ConcurrentMap[string, *net.Conn]
+	log            *logger.Logger
 }
 
 func NewHTTPProxyOverTCP() *HTTPOverTCP {
 	return &HTTPOverTCP{
-		cfg:             HTTPArgs{},
-		lockChn:         make(chan bool, 1),
-		isStop:          false,
-		serverChannels:  []*utils.ServerChannel{},
-		userConnections: cmap.New[*net.Conn](),
+		outPool:        utils.OutConn{},
+		cfg:            HTTPArgs{},
+		lockChn:        make(chan bool, 1),
+		isStop:         false,
+		serverChannels: []*utils.ServerChannel{},
+		userConns:      cmap.New[*net.Conn](),
 	}
 }
-
 func (s *HTTPOverTCP) StopService() {
 	defer func() {
 		e := recover()
@@ -46,11 +43,23 @@ func (s *HTTPOverTCP) StopService() {
 		}
 	}()
 	s.isStop = true
+	for _, sc := range s.serverChannels {
+		if sc.Listener != nil && *sc.Listener != nil {
+			(*sc.Listener).Close()
+		}
+		if sc.UDPListener != nil {
+			(*sc.UDPListener).Close()
+		}
+	}
 }
-func (s *HTTPOverTCP) Start(args HTTPArgs, proxy HttpProxy, log *logger.Logger) (err error) {
+func (s *HTTPOverTCP) Start(args HTTPArgs, log *logger.Logger) (err error) {
 	s.log = log
 	s.cfg = args
-	s.proxy = proxy
+
+	if s.cfg.Parent != "" {
+		s.log.Printf("use http parent %s", s.cfg.Parent)
+		s.InitOutConnPool()
+	}
 
 	for _, addr := range strings.Split(s.cfg.Local, ",") {
 		if addr != "" {
@@ -61,47 +70,11 @@ func (s *HTTPOverTCP) Start(args HTTPArgs, proxy HttpProxy, log *logger.Logger) 
 			if err != nil {
 				return
 			}
-			s.log.Printf("http proxy on %s", (*sc.Listener).Addr())
+			s.log.Printf("http(s) proxy on %s", (*sc.Listener).Addr())
 			s.serverChannels = append(s.serverChannels, &sc)
 		}
 	}
 	return
-}
-
-type hijackableResponseWriter struct {
-	inConn     net.Conn
-	buf        *bufio.ReadWriter
-	header     http.Header
-	status     int
-	written    bool
-	isHijacked bool
-}
-
-func (w *hijackableResponseWriter) Header() http.Header {
-	return w.header
-}
-
-func (w *hijackableResponseWriter) WriteHeader(status int) {
-	if w.written {
-		return
-	}
-	w.status = status
-	w.written = true
-}
-
-func (w *hijackableResponseWriter) Write(b []byte) (int, error) {
-	if !w.written {
-		w.WriteHeader(http.StatusOK)
-	}
-	return w.buf.Write(b)
-}
-
-func (w *hijackableResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if w.isHijacked {
-		return nil, nil, fmt.Errorf("connection already hijacked")
-	}
-	w.isHijacked = true
-	return w.inConn, w.buf, nil
 }
 
 func (s *HTTPOverTCP) Clean() {
@@ -114,7 +87,9 @@ func (s *HTTPOverTCP) callback(inConn net.Conn) {
 		}
 	}()
 
-	req, err := utils.NewHTTPRequest(&inConn, 4096, s.log)
+	var err interface{}
+	var req utils.HTTPRequest
+	req, err = utils.NewHTTPRequest(&inConn, 4096, s.log)
 	if err != nil {
 		if err != io.EOF {
 			s.log.Printf("decoder error , from %s, ERR:%s", inConn.RemoteAddr(), err)
@@ -122,36 +97,29 @@ func (s *HTTPOverTCP) callback(inConn net.Conn) {
 		utils.CloseConn(&inConn)
 		return
 	}
+	address := req.Host
+	host, _, _ := net.SplitHostPort(address)
+	useProxy := false
+	if !utils.IsIternalIP(host) {
+		useProxy = true
+		if s.cfg.Parent == "" {
+			useProxy = false
+		}
+	}
 
-	// Convert utils.HTTPRequest to http.Request
-	httpReq, err := s.convertToHTTPRequest(&req)
+	s.log.Printf("use proxy : %v, %s", useProxy, address)
+
+	err = s.OutToTCP(useProxy, address, &inConn, &req)
 	if err != nil {
-		s.log.Printf("failed to convert to http.Request: %v", err)
+		if s.cfg.Parent == "" {
+			s.log.Printf("connect to %s fail, ERR:%s", address, err)
+		} else {
+			s.log.Printf("connect to parent %s fail", s.cfg.Parent)
+		}
 		utils.CloseConn(&inConn)
-		return
 	}
-
-	// Create a ResponseWriter and serve the request using goproxy
-	w := &hijackableResponseWriter{
-		inConn:     inConn,
-		buf:        bufio.NewReadWriter(bufio.NewReader(inConn), bufio.NewWriter(inConn)),
-		header:     make(http.Header),
-		isHijacked: false,
-	}
-	s.proxy.ServeHTTP(w, httpReq)
 }
-
-func (s *HTTPOverTCP) convertToHTTPRequest(req *utils.HTTPRequest) (*http.Request, error) {
-	reader := bufio.NewReader(bytes.NewReader(req.HeadBuf))
-	httpReq, err := http.ReadRequest(reader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read http request: %v", err)
-	}
-	httpReq.RemoteAddr = (*req.Conn).RemoteAddr().String()
-	return httpReq, nil
-}
-
-func (s *HTTPOverTCP) OutToTCP(address string, inConn *net.Conn, req *utils.HTTPRequest) (err interface{}) {
+func (s *HTTPOverTCP) OutToTCP(useProxy bool, address string, inConn *net.Conn, req *utils.HTTPRequest) (err interface{}) {
 	inAddr := (*inConn).RemoteAddr().String()
 	inLocalAddr := (*inConn).LocalAddr().String()
 	//防止死循环
@@ -167,34 +135,42 @@ func (s *HTTPOverTCP) OutToTCP(address string, inConn *net.Conn, req *utils.HTTP
 		if s.isStop {
 			return
 		}
-		outConn, err = utils.ConnectHost(address, s.cfg.Timeout)
+		if useProxy {
+			outConn, err = s.outPool.Get()
+		} else {
+			outConn, err = utils.ConnectHost(s.Resolve(address), s.cfg.Timeout)
+		}
 		tryCount++
 		if err == nil || tryCount > maxTryCount {
 			break
 		} else {
-			s.log.Printf("connect to %s , err:%s,retrying...", address, err)
+			s.log.Printf("connect to %s , err:%s,retrying...", s.cfg.Parent, err)
 			time.Sleep(time.Second * 2)
 		}
 	}
 	if err != nil {
-		s.log.Printf("connect to %s , err:%s", inAddr, err)
+		s.log.Printf("connect to %s , err:%s", s.cfg.Parent, err)
 		utils.CloseConn(inConn)
 		return
 	}
 
 	outAddr := outConn.RemoteAddr().String()
 	//outLocalAddr := outConn.LocalAddr().String()
-	if req.IsHTTPS() {
+	if req.IsHTTPS() && !useProxy {
 		//https无上级或者上级非代理,proxy需要响应connect请求,并直连目标
 		err = req.HTTPSReply()
 	} else {
 		//https或者http,上级是代理,proxy需要转发
 		outConn.SetDeadline(time.Now().Add(time.Millisecond * time.Duration(s.cfg.Timeout)))
 		//直连目标或上级非代理,清理HTTP头部的代理头信息
-		_, err = outConn.Write(utils.RemoveProxyHeaders(req.HeadBuf))
+		if !useProxy {
+			_, err = outConn.Write(utils.RemoveProxyHeaders(req.HeadBuf))
+		} else {
+			_, err = outConn.Write(req.HeadBuf)
+		}
 		outConn.SetDeadline(time.Time{})
 		if err != nil {
-			s.log.Printf("write to %s , err:%s", inAddr, err)
+			s.log.Printf("write to %s , err:%s", s.cfg.Parent, err)
 			utils.CloseConn(inConn)
 			return
 		}
@@ -202,14 +178,21 @@ func (s *HTTPOverTCP) OutToTCP(address string, inConn *net.Conn, req *utils.HTTP
 
 	utils.IoBind((*inConn), outConn, func(err interface{}) {
 		s.log.Printf("conn %s - %s released [%s]", inAddr, outAddr, req.Host)
-		s.userConnections.Remove(inAddr)
+		s.userConns.Remove(inAddr)
 	}, s.log)
 	s.log.Printf("conn %s - %s connected [%s]", inAddr, outAddr, req.Host)
-	if c, ok := s.userConnections.Get(inAddr); ok {
+	if c, ok := s.userConns.Get(inAddr); ok {
 		(*c).Close()
 	}
-	s.userConnections.Set(inAddr, inConn)
+	s.userConns.Set(inAddr, inConn)
 	return
+}
+
+func (s *HTTPOverTCP) InitOutConnPool() {
+	s.outPool = utils.NewOutConn(
+		s.Resolve(s.cfg.Parent),
+		s.cfg.Timeout,
+	)
 }
 
 func (s *HTTPOverTCP) IsDeadLoop(inLocalAddr string, host string) bool {
@@ -223,6 +206,11 @@ func (s *HTTPOverTCP) IsDeadLoop(inLocalAddr string, host string) bool {
 	}
 	if inPort == outPort {
 		var outIPs []net.IP
+		/*	if *s.cfg.DNSAddress != "" {
+				outIPs = []net.IP{net.ParseIP(s.Resolve(outDomain))}
+			} else {
+				outIPs, err = net.LookupIP(outDomain)
+			}*/
 		outIPs, err = net.LookupIP(outDomain)
 		if err == nil {
 			for _, ip := range outIPs {
@@ -232,6 +220,11 @@ func (s *HTTPOverTCP) IsDeadLoop(inLocalAddr string, host string) bool {
 			}
 		}
 		interfaceIPs, err := utils.GetAllInterfaceAddr()
+		/*for _, ip := range *s.cfg.LocalIPS {
+			interfaceIPs = append(interfaceIPs, net.ParseIP(ip).To4())
+		}*/
+
+		interfaceIPs = append(interfaceIPs, net.ParseIP(s.cfg.Parent).To4())
 		if err == nil {
 			for _, localIP := range interfaceIPs {
 				for _, outIP := range outIPs {

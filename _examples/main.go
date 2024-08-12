@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/elazarl/goproxy"
 	"github.com/thanhkaiba/httproxytcp"
 	"log"
 	"net/http"
@@ -24,8 +25,9 @@ func main() {
 	p.Start(httproxytcp.HTTPArgs{
 		Local:       ":8284",
 		HTTPTimeout: 30,
+		Parent:      "127.0.0.1:3128",
 		Timeout:     2000,
-	}, proxy, log.New(os.Stdout, "\r\n", log.LstdFlags))
+	}, log.New(os.Stdout, "\r\n", log.LstdFlags))
 	Clean(p)
 }
 func Clean(s *httproxytcp.HTTPOverTCP) {

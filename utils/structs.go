@@ -141,3 +141,19 @@ func (req *HTTPRequest) addPortIfNot() (newHost string) {
 	}
 	return
 }
+
+type OutConn struct {
+	address string
+	timeout int
+}
+
+func NewOutConn(address string, timeout int) (op OutConn) {
+	return OutConn{
+		address: address,
+		timeout: timeout,
+	}
+}
+func (op *OutConn) Get() (conn net.Conn, err error) {
+	conn, err = ConnectHost(op.address, op.timeout)
+	return
+}

@@ -6,6 +6,7 @@ import (
 	"io"
 	logger "log"
 	"net"
+	"strconv"
 
 	"strings"
 	"time"
@@ -163,4 +164,28 @@ func RemoveProxyHeaders(head []byte) []byte {
 		}
 	}
 	return bytes.Join(newLines, []byte("\r\n"))
+}
+
+func IsIternalIP(domainOrIP string) bool {
+	var outIPs []net.IP
+	outIPs, err := net.LookupIP(domainOrIP)
+	if err != nil {
+		return false
+	}
+	for _, ip := range outIPs {
+		if ip.IsLoopback() {
+			return true
+		}
+		if ip.To4().Mask(net.IPv4Mask(255, 0, 0, 0)).String() == "10.0.0.0" {
+			return true
+		}
+		if ip.To4().Mask(net.IPv4Mask(255, 0, 0, 0)).String() == "192.168.0.0" {
+			return true
+		}
+		if ip.To4().Mask(net.IPv4Mask(255, 0, 0, 0)).String() == "172.0.0.0" {
+			i, _ := strconv.Atoi(strings.Split(ip.To4().String(), ".")[1])
+			return i >= 16 && i <= 31
+		}
+	}
+	return false
 }
