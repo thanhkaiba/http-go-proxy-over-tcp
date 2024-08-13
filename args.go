@@ -5,4 +5,5 @@ type HTTPArgs struct {
 	Parent      string
 	HTTPTimeout int
 	Timeout     int
+	DNSAddress  string
 }

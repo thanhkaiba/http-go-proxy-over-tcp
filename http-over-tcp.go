@@ -18,6 +18,7 @@ type HTTPOverTCP struct {
 	cfg            HTTPArgs
 	lockChn        chan bool
 	isStop         bool
+	domainResolver utils.DomainResolver
 	serverChannels []*utils.ServerChannel
 	userConns      cmap.ConcurrentMap[string, *net.Conn]
 	log            *logger.Logger
@@ -46,9 +47,6 @@ func (s *HTTPOverTCP) StopService() {
 	for _, sc := range s.serverChannels {
 		if sc.Listener != nil && *sc.Listener != nil {
 			(*sc.Listener).Close()
-		}
-		if sc.UDPListener != nil {
-			(*sc.UDPListener).Close()
 		}
 	}
 }
@@ -99,13 +97,7 @@ func (s *HTTPOverTCP) callback(inConn net.Conn) {
 	}
 	address := req.Host
 	host, _, _ := net.SplitHostPort(address)
-	useProxy := false
-	if !utils.IsIternalIP(host) {
-		useProxy = true
-		if s.cfg.Parent == "" {
-			useProxy = false
-		}
-	}
+	useProxy := s.cfg.Parent != "" && !utils.IsIternalIP(host)
 
 	s.log.Printf("use proxy : %v, %s", useProxy, address)
 
@@ -176,7 +168,7 @@ func (s *HTTPOverTCP) OutToTCP(useProxy bool, address string, inConn *net.Conn, 
 		}
 	}
 
-	utils.IoBind((*inConn), outConn, func(err interface{}) {
+	utils.IoBind(*inConn, outConn, func(err interface{}) {
 		s.log.Printf("conn %s - %s released [%s]", inAddr, outAddr, req.Host)
 		s.userConns.Remove(inAddr)
 	}, s.log)
@@ -206,11 +198,11 @@ func (s *HTTPOverTCP) IsDeadLoop(inLocalAddr string, host string) bool {
 	}
 	if inPort == outPort {
 		var outIPs []net.IP
-		/*	if *s.cfg.DNSAddress != "" {
-				outIPs = []net.IP{net.ParseIP(s.Resolve(outDomain))}
-			} else {
-				outIPs, err = net.LookupIP(outDomain)
-			}*/
+		if s.cfg.DNSAddress != "" {
+			outIPs = []net.IP{net.ParseIP(s.Resolve(outDomain))}
+		} else {
+			outIPs, err = net.LookupIP(outDomain)
+		}
 		outIPs, err = net.LookupIP(outDomain)
 		if err == nil {
 			for _, ip := range outIPs {
@@ -236,4 +228,15 @@ func (s *HTTPOverTCP) IsDeadLoop(inLocalAddr string, host string) bool {
 		}
 	}
 	return false
+}
+
+func (s *HTTPOverTCP) Resolve(address string) string {
+	if s.cfg.DNSAddress == "" {
+		return address
+	}
+	ip, err := s.domainResolver.Resolve(address)
+	if err != nil {
+		s.log.Printf("dns error %s , ERR:%s", address, err)
+	}
+	return ip
 }
