@@ -50,6 +50,9 @@ func NewHTTPRequest(inConn *net.Conn, bufSize int, log *logger.Logger, header ..
 		//sni success
 		req.Method = "SNI"
 		req.hostOrURL = "https://" + serverName + ":443"
+
+		// Push back the read data into the connection buffer
+		*inConn = wrapConnWithBuffer(*inConn, req.HeadBuf)
 	} else {
 		//sni fail , try http
 		index := bytes.IndexByte(req.HeadBuf, '\n')
@@ -74,6 +77,33 @@ func NewHTTPRequest(inConn *net.Conn, bufSize int, log *logger.Logger, header ..
 		err = req.HTTP()
 	}
 	return
+}
+
+type bufferedConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (b *bufferedConn) Read(p []byte) (int, error) {
+	return b.reader.Read(p)
+}
+
+func wrapConnWithBuffer(conn net.Conn, buf []byte) net.Conn {
+	// Create a pipe
+	pr, pw := io.Pipe()
+
+	// Write the buffer into the pipe writer
+	go func() {
+		pw.Write(buf)
+		io.Copy(pw, conn) // Continue to copy the rest of the data from the original connection
+		pw.Close()
+	}()
+
+	// Return the custom bufferedConn that uses the pipe reader as its source
+	return &bufferedConn{
+		Conn:   conn,
+		reader: io.MultiReader(pr, conn),
+	}
 }
 func (req *HTTPRequest) HTTP() (err error) {
 	req.URL = req.getHTTPURL()

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/elazarl/goproxy"
 	"github.com/thanhkaiba/httproxytcp"
 	"log"
 	"net/http"
@@ -20,6 +21,10 @@ func main() {
 				"Don't waste your time!")
 		})
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.Verbose = true
+	go func() {
+		http.ListenAndServe(":8282", proxy)
+	}()
 	p := httproxytcp.NewHTTPProxyOverTCP()
 	p.Start(httproxytcp.HTTPArgs{
 		Local:       ":8284",

@@ -123,22 +123,65 @@ func (s *HTTPOverTCP) callback(inConn net.Conn) {
 		return
 	}
 
-	// Convert utils.HTTPRequest to http.Request
-	httpReq, err := s.convertToHTTPRequest(&req)
-	if err != nil {
-		s.log.Printf("failed to convert to http.Request: %v", err)
-		utils.CloseConn(&inConn)
-		return
-	}
+	if req.Method != "SNI" {
+		// Convert utils.HTTPRequest to http.Request
+		httpReq, err := s.convertToHTTPRequest(&req)
+		if err != nil {
+			s.log.Printf("failed to convert to http.Request: %v", err)
+			utils.CloseConn(&inConn)
+			return
+		}
 
-	// Create a ResponseWriter and serve the request using goproxy
-	w := &hijackableResponseWriter{
-		inConn:     inConn,
-		buf:        bufio.NewReadWriter(bufio.NewReader(inConn), bufio.NewWriter(inConn)),
-		header:     make(http.Header),
-		isHijacked: false,
+		// Create a ResponseWriter and serve the request using goproxy
+		w := &hijackableResponseWriter{
+			inConn:     inConn,
+			buf:        bufio.NewReadWriter(bufio.NewReader(inConn), bufio.NewWriter(inConn)),
+			header:     make(http.Header),
+			isHijacked: false,
+		}
+		s.proxy.ServeHTTP(w, httpReq)
+	} else {
+
+		// Determine the address of the target HTTP proxy
+		targetProxyAddr := "127.0.0.1:8282" // Replace with the actual address
+
+		// Establish a connection to the target HTTP proxy
+		outConn, err := net.Dial("tcp", targetProxyAddr)
+		if err != nil {
+			s.log.Printf("Failed to connect to HTTP proxy: %v", err)
+			utils.CloseConn(&inConn)
+			return
+		}
+
+		// Send the CONNECT request to the HTTP proxy
+		logger.Println("req.Host", req.Host)
+		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", req.Host, req.Host)
+		_, err = outConn.Write([]byte(connectReq))
+		if err != nil {
+			s.log.Printf("Failed to send CONNECT request: %v", err)
+			utils.CloseConn(&outConn)
+			utils.CloseConn(&inConn)
+			return
+		}
+
+		// Read the proxy's response to the CONNECT request
+		resp, err := http.ReadResponse(bufio.NewReader(outConn), nil)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			s.log.Printf("CONNECT request failed: %v", err)
+			utils.CloseConn(&outConn)
+			utils.CloseConn(&inConn)
+			return
+		}
+
+		inAddr := (inConn).RemoteAddr().String()
+		utils.IoBind(inConn, outConn, func(err interface{}) {
+			s.userConnections.Remove(inAddr)
+		}, s.log)
+		if c, ok := s.userConnections.Get(inAddr); ok {
+			(*c).Close()
+		}
+		s.userConnections.Set(inAddr, &inConn)
 	}
-	s.proxy.ServeHTTP(w, httpReq)
 }
 
 func (s *HTTPOverTCP) convertToHTTPRequest(req *utils.HTTPRequest) (*http.Request, error) {
