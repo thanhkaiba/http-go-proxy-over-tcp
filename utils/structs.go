@@ -69,7 +69,6 @@ func NewHTTPRequest(inConn *net.Conn, bufSize int, log *logger.Logger, header ..
 		return
 	}
 	req.Method = strings.ToUpper(req.Method)
-	log.Printf("%s:%s", req.Method, req.hostOrURL)
 
 	if req.IsHTTPS() {
 		err = req.HTTPS()

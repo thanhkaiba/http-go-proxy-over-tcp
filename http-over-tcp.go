@@ -10,6 +10,7 @@ import (
 	logger "log"
 	"net"
 	"net/http"
+	"net/url"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -141,46 +142,29 @@ func (s *HTTPOverTCP) callback(inConn net.Conn) {
 		}
 		s.proxy.ServeHTTP(w, httpReq)
 	} else {
-
-		// Determine the address of the target HTTP proxy
-		targetProxyAddr := "127.0.0.1:8282" // Replace with the actual address
-
-		// Establish a connection to the target HTTP proxy
-		outConn, err := net.Dial("tcp", targetProxyAddr)
+		// Create the CONNECT request
+		connectReq, err := http.NewRequest("CONNECT", req.Host, nil)
 		if err != nil {
-			s.log.Printf("Failed to connect to HTTP proxy: %v", err)
+			s.log.Printf("failed to create CONNECT request: %v", err)
 			utils.CloseConn(&inConn)
 			return
 		}
 
-		// Send the CONNECT request to the HTTP proxy
-		logger.Println("req.Host", req.Host)
-		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", req.Host, req.Host)
-		_, err = outConn.Write([]byte(connectReq))
-		if err != nil {
-			s.log.Printf("Failed to send CONNECT request: %v", err)
-			utils.CloseConn(&outConn)
-			utils.CloseConn(&inConn)
-			return
+		connectReq.URL, _ = url.Parse(req.URL)
+		connectReq.Host = req.Host
+		connectReq.RemoteAddr = inConn.RemoteAddr().String()
+		connectReq.Header.Set("Host", req.Host)
+
+		// Create a ResponseWriter and serve the CONNECT request using goproxy
+		w := &hijackableResponseWriter{
+			inConn:     inConn,
+			buf:        bufio.NewReadWriter(bufio.NewReader(inConn), bufio.NewWriter(inConn)),
+			header:     make(http.Header),
+			isHijacked: false,
 		}
 
-		// Read the proxy's response to the CONNECT request
-		resp, err := http.ReadResponse(bufio.NewReader(outConn), nil)
-		if err != nil || resp.StatusCode != http.StatusOK {
-			s.log.Printf("CONNECT request failed: %v", err)
-			utils.CloseConn(&outConn)
-			utils.CloseConn(&inConn)
-			return
-		}
-
-		inAddr := (inConn).RemoteAddr().String()
-		utils.IoBind(inConn, outConn, func(err interface{}) {
-			s.userConnections.Remove(inAddr)
-		}, s.log)
-		if c, ok := s.userConnections.Get(inAddr); ok {
-			(*c).Close()
-		}
-		s.userConnections.Set(inAddr, &inConn)
+		// Pass the CONNECT request to the proxy for handling
+		s.proxy.ServeHTTP(w, connectReq)
 	}
 }
 
