@@ -21,13 +21,14 @@ func main() {
 				"Don't waste your time!")
 		})
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
-	proxy.Verbose = true
-	go func() {
-		http.ListenAndServe(":8282", proxy)
-	}()
+	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		log.Println("###url: " + resp.Request.URL.String())
+		log.Println("###host: " + resp.Request.Host)
+		return resp
+	})
 	p := httproxytcp.NewHTTPProxyOverTCP()
 	p.Start(httproxytcp.HTTPArgs{
-		Local:       ":8284",
+		Local:       ":8285",
 		HTTPTimeout: 30,
 		Timeout:     2000,
 	}, proxy, log.New(os.Stdout, "\r\n", log.LstdFlags))

@@ -178,7 +178,7 @@ func (s *HTTPOverTCP) convertToHTTPRequest(req *utils.HTTPRequest) (*http.Reques
 	return httpReq, nil
 }
 
-func (s *HTTPOverTCP) OutToTCP(address string, inConn *net.Conn, req *utils.HTTPRequest) (err interface{}) {
+func (s *HTTPOverTCP) OutToTCP(useProxy bool, address string, inConn *net.Conn, req *utils.HTTPRequest) (lbAddr string, err interface{}) {
 	inAddr := (*inConn).RemoteAddr().String()
 	inLocalAddr := (*inConn).LocalAddr().String()
 	//防止死循环
@@ -194,7 +194,11 @@ func (s *HTTPOverTCP) OutToTCP(address string, inConn *net.Conn, req *utils.HTTP
 		if s.isStop {
 			return
 		}
-		outConn, err = utils.ConnectHost(address, s.cfg.Timeout)
+		if useProxy {
+			outConn, err = s.GetParentConn(address)
+		} else {
+			outConn, err = utils.ConnectHost(address, s.cfg.Timeout)
+		}
 		tryCount++
 		if err == nil || tryCount > maxTryCount {
 			break
@@ -211,14 +215,18 @@ func (s *HTTPOverTCP) OutToTCP(address string, inConn *net.Conn, req *utils.HTTP
 
 	outAddr := outConn.RemoteAddr().String()
 	//outLocalAddr := outConn.LocalAddr().String()
-	if req.IsHTTPS() {
+	if req.IsHTTPS() && !useProxy {
 		//https无上级或者上级非代理,proxy需要响应connect请求,并直连目标
 		err = req.HTTPSReply()
 	} else {
 		//https或者http,上级是代理,proxy需要转发
 		outConn.SetDeadline(time.Now().Add(time.Millisecond * time.Duration(s.cfg.Timeout)))
-		//直连目标或上级非代理,清理HTTP头部的代理头信息
-		_, err = outConn.Write(utils.RemoveProxyHeaders(req.HeadBuf))
+		//直连目标或上级非代理或非SNI,,清理HTTP头部的代理头信息
+		if !useProxy && !(req.Method == "SNI") {
+			_, err = outConn.Write(utils.RemoveProxyHeaders(req.HeadBuf))
+		} else {
+			_, err = outConn.Write(req.HeadBuf)
+		}
 		outConn.SetDeadline(time.Time{})
 		if err != nil {
 			s.log.Printf("write to %s , err:%s", inAddr, err)
@@ -236,6 +244,11 @@ func (s *HTTPOverTCP) OutToTCP(address string, inConn *net.Conn, req *utils.HTTP
 		(*c).Close()
 	}
 	s.userConnections.Set(inAddr, inConn)
+	return
+}
+
+func (s *HTTPOverTCP) GetParentConn(address string) (conn net.Conn, err error) {
+	conn, err = utils.ConnectHost(address, s.cfg.Timeout)
 	return
 }
 
@@ -270,4 +283,8 @@ func (s *HTTPOverTCP) IsDeadLoop(inLocalAddr string, host string) bool {
 		}
 	}
 	return false
+}
+
+func (s *HTTPOverTCP) GetDirectConn(address string, localAddr string) (conn net.Conn, err error) {
+	return utils.ConnectHost(address, s.cfg.Timeout)
 }
