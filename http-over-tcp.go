@@ -14,7 +14,9 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 )
 
 type HTTPOverTCP struct {
@@ -114,6 +116,7 @@ func (s *HTTPOverTCP) callback(inConn net.Conn) {
 			s.log.Printf("http(s) conn handler crashed with err : %s \nstack: %s", err, string(debug.Stack()))
 		}
 	}()
+	s.check(inConn)
 
 	req, err := utils.NewHTTPRequest(&inConn, 4096, s.log)
 	if err != nil {
@@ -287,4 +290,110 @@ func (s *HTTPOverTCP) IsDeadLoop(inLocalAddr string, host string) bool {
 
 func (s *HTTPOverTCP) GetDirectConn(address string, localAddr string) (conn net.Conn, err error) {
 	return utils.ConnectHost(address, s.cfg.Timeout)
+}
+
+// SOCKADDR_IN representation (IPv4)
+type SOCKADDR_IN struct {
+	Family uint16 // AF_INET
+	Port   uint16
+	Addr   [4]byte
+	_      [8]byte // Padding
+}
+
+// SOCKADDR_IN6 representation (IPv6)
+type SOCKADDR_IN6 struct {
+	Family   uint16 // AF_INET6
+	Port     uint16
+	FlowInfo uint32
+	Addr     [16]byte
+	ScopeID  uint32
+}
+
+// SOCKADDR_STORAGE is a generic structure
+type SOCKADDR_STORAGE struct {
+	Family uint16 // sa_family (2 bytes for address family)
+	_      [126]byte
+}
+
+const (
+	SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT = syscall.IOC_IN | syscall.IOC_VENDOR | 221
+	ContextSize                               = 1024 // Adjust context size as needed
+)
+
+func (s *HTTPOverTCP) check(inConn net.Conn) {
+
+	// Extract the file descriptor from the connection
+	rawConn, err := inConn.(*net.TCPConn).SyscallConn()
+	if err != nil {
+		fmt.Println("Error getting raw connection:", err)
+		return
+	}
+
+	var clientSock syscall.Handle
+	err = rawConn.Control(func(fd uintptr) {
+		clientSock = syscall.Handle(fd) // Cast the file descriptor to a syscall.Handle
+	})
+	if err != nil {
+		fmt.Printf("Error accessing raw socket: %v\n", err)
+		return
+	}
+	// Retrieve the redirect context
+	redirectContext := make([]byte, ContextSize)
+	var bytesReturned uint32
+
+	// Call WSAIoctl with correct parameters
+	err = syscall.WSAIoctl(
+		clientSock,
+		SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT,
+		nil,                          // No input buffer
+		0,                            // Input buffer size
+		&redirectContext[0],          // Output buffer
+		uint32(len(redirectContext)), // Output buffer size
+		&bytesReturned,               // Pointer to the number of bytes returned
+		nil,                          // Pointer for overlapped (set to uintptr(0) for synchronous call)
+		uintptr(0),                   // Pointer for completion routine (set to uintptr(0) for synchronous call)
+	)
+
+	if err != nil {
+		s.log.Fatalf("WSAIoctl failed: %v\n", err)
+	}
+
+	// Check if the returned size is sufficient for two SOCKADDR_STORAGE structures
+	if bytesReturned < uint32(2*unsafe.Sizeof(SOCKADDR_STORAGE{})) {
+		fmt.Printf("Insufficient data returned. Expected at least %d bytes but got %d.\n",
+			2*unsafe.Sizeof(SOCKADDR_STORAGE{}), bytesReturned)
+		return
+	}
+
+	// Extract the first SOCKADDR_STORAGE entry
+	firstSockAddr := (*SOCKADDR_STORAGE)(unsafe.Pointer(&redirectContext[0]))
+	// Extract the second SOCKADDR_STORAGE entry
+	secondSockAddr := (*SOCKADDR_STORAGE)(unsafe.Pointer(&redirectContext[unsafe.Sizeof(SOCKADDR_STORAGE{})]))
+
+	// Output the retrieved redirect context information
+	fmt.Printf("WFP Redirect Context retrieved successfully. Bytes returned: %d\n", bytesReturned)
+
+	// Print details and IP address for the first SOCKADDR_STORAGE entry
+	printIPAddress(firstSockAddr, "First")
+
+	// Print details and IP address for the second SOCKADDR_STORAGE entry
+	printIPAddress(secondSockAddr, "Second")
+}
+
+// Helper function to print IP address
+func printIPAddress(sockAddr *SOCKADDR_STORAGE, label string) {
+	switch sockAddr.Family {
+	case syscall.AF_INET:
+		// Handle IPv4
+		ipv4 := (*SOCKADDR_IN)(unsafe.Pointer(sockAddr))
+		ip := net.IPv4(ipv4.Addr[0], ipv4.Addr[1], ipv4.Addr[2], ipv4.Addr[3])
+		fmt.Printf("%s Address Family: AF_INET (IPv4) -> IP Address: %s\n", label, ip.String())
+	case syscall.AF_INET6:
+		// Handle IPv6
+		ipv6 := (*SOCKADDR_IN6)(unsafe.Pointer(sockAddr))
+		ip := net.IP(ipv6.Addr[:])
+		fmt.Printf("%s Address Family: AF_INET6 (IPv6) -> IP Address: %s\n", label, ip.String())
+	default:
+		fmt.Printf("%s Address Family: Unknown (%d)\n", label, sockAddr.Family)
+	}
 }
