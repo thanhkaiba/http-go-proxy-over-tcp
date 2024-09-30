@@ -321,7 +321,6 @@ const (
 )
 
 func (s *HTTPOverTCP) check(inConn net.Conn) {
-
 	// Extract the file descriptor from the connection
 	rawConn, err := inConn.(*net.TCPConn).SyscallConn()
 	if err != nil {
@@ -330,14 +329,14 @@ func (s *HTTPOverTCP) check(inConn net.Conn) {
 	}
 
 	var clientSock syscall.Handle
-	err = rawConn.Control(func(fd uintptr) {
-		clientSock = syscall.Handle(fd) // Cast the file descriptor to a syscall.Handle
-	})
-	if err != nil {
+	if err = rawConn.Control(func(fd uintptr) {
+		clientSock = syscall.Handle(fd)
+	}); err != nil {
 		fmt.Printf("Error accessing raw socket: %v\n", err)
 		return
 	}
-	// Retrieve the redirect context
+
+	// Allocate redirect context buffer once
 	redirectContext := make([]byte, ContextSize)
 	var bytesReturned uint32
 
@@ -345,51 +344,44 @@ func (s *HTTPOverTCP) check(inConn net.Conn) {
 	err = syscall.WSAIoctl(
 		clientSock,
 		SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT,
-		nil,                          // No input buffer
-		0,                            // Input buffer size
-		&redirectContext[0],          // Output buffer
-		uint32(len(redirectContext)), // Output buffer size
-		&bytesReturned,               // Pointer to the number of bytes returned
-		nil,                          // Pointer for overlapped (set to uintptr(0) for synchronous call)
-		uintptr(0),                   // Pointer for completion routine (set to uintptr(0) for synchronous call)
+		nil,
+		0,
+		&redirectContext[0],
+		uint32(len(redirectContext)),
+		&bytesReturned,
+		nil,
+		0,
 	)
 
 	if err != nil {
 		s.log.Fatalf("WSAIoctl failed: %v\n", err)
 	}
 
-	// Check if the returned size is sufficient for two SOCKADDR_STORAGE structures
-	if bytesReturned < uint32(2*unsafe.Sizeof(SOCKADDR_STORAGE{})) {
-		fmt.Printf("Insufficient data returned. Expected at least %d bytes but got %d.\n",
-			2*unsafe.Sizeof(SOCKADDR_STORAGE{}), bytesReturned)
+	const sockaddrStorageSize = uint32(unsafe.Sizeof(SOCKADDR_STORAGE{}))
+	if bytesReturned < 2*sockaddrStorageSize {
+		fmt.Printf("Insufficient data returned. Expected at least %d bytes but got %d.\n", 2*sockaddrStorageSize, bytesReturned)
 		return
 	}
 
-	// Extract the first SOCKADDR_STORAGE entry
+	// Extract and handle the SOCKADDR_STORAGE entries
 	firstSockAddr := (*SOCKADDR_STORAGE)(unsafe.Pointer(&redirectContext[0]))
-	// Extract the second SOCKADDR_STORAGE entry
-	secondSockAddr := (*SOCKADDR_STORAGE)(unsafe.Pointer(&redirectContext[unsafe.Sizeof(SOCKADDR_STORAGE{})]))
+	//secondSockAddr := (*SOCKADDR_STORAGE)(unsafe.Pointer(&redirectContext[sockaddrStorageSize]))
 
-	// Output the retrieved redirect context information
 	fmt.Printf("WFP Redirect Context retrieved successfully. Bytes returned: %d\n", bytesReturned)
 
-	// Print details and IP address for the first SOCKADDR_STORAGE entry
+	// Encapsulated printIPAddress logic
 	printIPAddress(firstSockAddr, "First")
-
-	// Print details and IP address for the second SOCKADDR_STORAGE entry
-	printIPAddress(secondSockAddr, "Second")
+	//printIPAddress(secondSockAddr, "Second")
 }
 
 // Helper function to print IP address
 func printIPAddress(sockAddr *SOCKADDR_STORAGE, label string) {
 	switch sockAddr.Family {
 	case syscall.AF_INET:
-		// Handle IPv4
 		ipv4 := (*SOCKADDR_IN)(unsafe.Pointer(sockAddr))
 		ip := net.IPv4(ipv4.Addr[0], ipv4.Addr[1], ipv4.Addr[2], ipv4.Addr[3])
 		fmt.Printf("%s Address Family: AF_INET (IPv4) -> IP Address: %s\n", label, ip.String())
 	case syscall.AF_INET6:
-		// Handle IPv6
 		ipv6 := (*SOCKADDR_IN6)(unsafe.Pointer(sockAddr))
 		ip := net.IP(ipv6.Addr[:])
 		fmt.Printf("%s Address Family: AF_INET6 (IPv6) -> IP Address: %s\n", label, ip.String())
